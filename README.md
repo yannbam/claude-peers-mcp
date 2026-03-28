@@ -20,7 +20,7 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 ```bash
 git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
 cd ~/claude-peers-mcp
-bun install
+pnpm install
 ```
 
 ### 2. Register the MCP server
@@ -28,7 +28,7 @@ bun install
 This makes claude-peers available in every Claude Code session, from any directory:
 
 ```bash
-claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers-mcp/server.ts
+claude mcp add --scope user --transport stdio claude-peers -- pnpm --dir ~/claude-peers-mcp exec tsx server.ts
 ```
 
 Replace `~/claude-peers-mcp` with wherever you cloned it.
@@ -63,7 +63,7 @@ The other Claude receives it immediately and responds.
 
 | Tool             | What it does                                                                   |
 | ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
+| `list_peers`     | Find other Claude Code instances - scoped to `machine`, `directory`, or `repo` |
 | `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
 | `check_messages` | Manually check for messages (fallback if not using channel mode)               |
@@ -99,10 +99,10 @@ You can also inspect and interact from the command line:
 ```bash
 cd ~/claude-peers-mcp
 
-bun cli.ts status            # broker status + all peers
-bun cli.ts peers             # list peers
-bun cli.ts send <id> <msg>   # send a message into a Claude session
-bun cli.ts kill-broker       # stop the broker
+pnpm run cli -- status            # broker status + all peers
+pnpm run cli -- peers             # list peers
+pnpm run cli -- send <id> <msg>   # send a message into a Claude session
+pnpm run cli -- kill-broker       # stop the broker
 ```
 
 ## Configuration
@@ -111,10 +111,11 @@ bun cli.ts kill-broker       # stop the broker
 | -------------------- | -------------------- | ------------------------------------- |
 | `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
 | `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| `OPENAI_API_KEY`     | -                    | Enables auto-summary via gpt-5.4-nano |
 
 ## Requirements
 
-- [Bun](https://bun.sh)
+- Node.js 22+
+- pnpm
 - Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
+- claude.ai login (channels require it - API key auth won't work)

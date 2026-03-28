@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * claude-peers MCP server
  *
@@ -10,137 +9,60 @@
  *   claude --dangerously-load-development-channels server:claude-peers
  *
  * With .mcp.json:
- *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+ *   { "claude-peers": { "command": "pnpm", "args": ["exec", "tsx", "./server.ts"] } }
  */
 
+import { execFileSync, spawn } from "node:child_process";
+import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type {
-  PeerId,
-  Peer,
-  RegisterResponse,
-  PollMessagesResponse,
-  Message,
-} from "./shared/types.ts";
+import { execFileText } from "./shared/subprocess.ts";
 import {
   generateSummary,
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import type {
+  Peer,
+  PeerId,
+  PeerScope,
+  PollMessagesResponse,
+  RegisterResponse,
+} from "./shared/types.ts";
 
-// --- Configuration ---
+/** Port used by the local broker daemon. */
+const BROKER_PORT = Number.parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+/** Base URL for broker API requests. */
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
-const POLL_INTERVAL_MS = 1000;
+
+/** Poll cadence for inbound peer messages. */
+const POLL_INTERVAL_MS = 1_000;
+
+/** Heartbeat cadence that keeps broker registrations alive. */
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
-// --- Broker communication ---
+/** Project root that contains the broker entrypoint and local dev dependencies. */
+const PROJECT_ROOT = dirname(fileURLToPath(import.meta.url));
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BROKER_URL}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Broker error (${path}): ${res.status} ${err}`);
-  }
-  return res.json() as Promise<T>;
-}
+/** Absolute path to the broker entrypoint. */
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 
-async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
+/** Platform-aware path to the locally installed tsx launcher. */
+const TSX_BINARY = join(
+  PROJECT_ROOT,
+  "node_modules",
+  ".bin",
+  process.platform === "win32" ? "tsx.cmd" : "tsx"
+);
 
-async function ensureBroker(): Promise<void> {
-  if (await isBrokerAlive()) {
-    log("Broker already running");
-    return;
-  }
-
-  log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
-    stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
-  });
-
-  // Unref so this process can exit without waiting for the broker
-  proc.unref();
-
-  // Wait for it to come up
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 200));
-    if (await isBrokerAlive()) {
-      log("Broker started");
-      return;
-    }
-  }
-  throw new Error("Failed to start broker daemon after 6 seconds");
-}
-
-// --- Utility ---
-
-function log(msg: string) {
-  // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
-  console.error(`[claude-peers] ${msg}`);
-}
-
-async function getGitRoot(cwd: string): Promise<string | null> {
-  try {
-    const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
-    }
-  } catch {
-    // not a git repo
-  }
-  return null;
-}
-
-function getTty(): string | null {
-  try {
-    // Try to get the parent's tty from the process tree
-    const ppid = process.ppid;
-    if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
-      const tty = new TextDecoder().decode(proc.stdout).trim();
-      if (tty && tty !== "?" && tty !== "??") {
-        return tty;
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-// --- State ---
-
-let myId: PeerId | null = null;
-let myCwd = process.cwd();
-let myGitRoot: string | null = null;
-
-// --- MCP Server ---
-
+/** Shared MCP server instance for the stdio transport. */
 const mcp = new Server(
   { name: "claude-peers", version: "0.1.0" },
   {
@@ -150,7 +72,7 @@ const mcp = new Server(
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder - answer right away, even if you're in the middle of something.
 
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
@@ -164,8 +86,7 @@ When you start, proactively call set_summary to describe what you're working on.
   }
 );
 
-// --- Tool definitions ---
-
+/** Tool descriptors exposed to Claude Code. */
 const TOOLS = [
   {
     name: "list_peers",
@@ -227,20 +148,46 @@ const TOOLS = [
       properties: {},
     },
   },
-];
+] as const;
 
-// --- Tool handlers ---
+/** Broker-issued peer ID for the current Claude session. */
+let myId: PeerId | null = null;
 
+/** Current working directory for the Claude session that owns this MCP process. */
+let myCwd = process.cwd();
+
+/** Git root for the owning Claude session, if the cwd is inside a repository. */
+let myGitRoot: string | null = null;
+
+/** Guard that prevents duplicate unregister attempts during shutdown. */
+let cleaningUp = false;
+
+/** Emit server diagnostics on stderr so stdout remains pure MCP traffic. */
+function log(message: string): void {
+  console.error(`[claude-peers] ${message}`);
+}
+
+/** Wrap a plain text string in the MCP tool response envelope. */
+function createTextResult(text: string, isError = false) {
+  return {
+    content: [{ type: "text" as const, text }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+// Wire the advertised tool capability to concrete MCP handlers before the transport connects.
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
-mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args } = req.params;
+// Route tool calls into the local broker-backed peer operations.
+mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args = {} } = request.params;
 
   switch (name) {
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+      const scope = (args as { scope: PeerScope }).scope;
+
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
@@ -250,147 +197,102 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         });
 
         if (peers.length === 0) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `No other Claude Code instances found (scope: ${scope}).`,
-              },
-            ],
-          };
+          return createTextResult(`No other Claude Code instances found (scope: ${scope}).`);
         }
 
-        const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
-          ];
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
+        // Render peers in a copy/paste-friendly block for terminal users and agents alike.
+        const lines = peers.map((peer) => {
+          const parts = [`ID: ${peer.id}`, `PID: ${peer.pid}`, `CWD: ${peer.cwd}`];
+          if (peer.git_root) {
+            parts.push(`Repo: ${peer.git_root}`);
+          }
+          if (peer.tty) {
+            parts.push(`TTY: ${peer.tty}`);
+          }
+          if (peer.summary) {
+            parts.push(`Summary: ${peer.summary}`);
+          }
+          parts.push(`Last seen: ${peer.last_seen}`);
           return parts.join("\n  ");
         });
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error listing peers: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
+        return createTextResult(
+          `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`
+        );
+      } catch (error) {
+        return createTextResult(
+          `Error listing peers: ${error instanceof Error ? error.message : String(error)}`,
+          true
+        );
       }
     }
 
     case "send_message": {
       const { to_id, message } = args as { to_id: string; message: string };
       if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+        return createTextResult("Not registered with broker yet", true);
       }
+
       try {
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
           from_id: myId,
           to_id,
           text: message,
         });
+
         if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
-            isError: true,
-          };
+          return createTextResult(`Failed to send: ${result.error}`, true);
         }
-        return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
+
+        return createTextResult(`Message sent to peer ${to_id}`);
+      } catch (error) {
+        return createTextResult(
+          `Error sending message: ${error instanceof Error ? error.message : String(error)}`,
+          true
+        );
       }
     }
 
     case "set_summary": {
       const { summary } = args as { summary: string };
       if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+        return createTextResult("Not registered with broker yet", true);
       }
+
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
-        return {
-          content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error setting summary: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
+        return createTextResult(`Summary updated: "${summary}"`);
+      } catch (error) {
+        return createTextResult(
+          `Error setting summary: ${error instanceof Error ? error.message : String(error)}`,
+          true
+        );
       }
     }
 
     case "check_messages": {
       if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+        return createTextResult("Not registered with broker yet", true);
       }
+
       try {
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+
         if (result.messages.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: "No new messages." }],
-          };
+          return createTextResult("No new messages.");
         }
+
         const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
+          (message) => `From ${message.from_id} (${message.sent_at}):\n${message.text}`
         );
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
+        return createTextResult(
+          `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`
+        );
+      } catch (error) {
+        return createTextResult(
+          `Error checking messages: ${error instanceof Error ? error.message : String(error)}`,
+          true
+        );
       }
     }
 
@@ -399,62 +301,176 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop for inbound messages ---
+/** Call one JSON-based broker endpoint. */
+async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BROKER_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
-async function pollAndPushMessages() {
-  if (!myId) return;
+  if (!res.ok) {
+    throw new Error(`Broker error (${path}): ${res.status} ${await res.text()}`);
+  }
+
+  return (await res.json()) as T;
+}
+
+/** Probe the broker health endpoint. */
+async function isBrokerAlive(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BROKER_URL}/health`, {
+      signal: AbortSignal.timeout(2_000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Start the broker in the background when this is the first active MCP server. */
+async function ensureBroker(): Promise<void> {
+  if (await isBrokerAlive()) {
+    log("Broker already running");
+    return;
+  }
+
+  log("Starting broker daemon...");
+  const brokerProcess = spawn(TSX_BINARY, [BROKER_SCRIPT], {
+    cwd: PROJECT_ROOT,
+    detached: true,
+    stdio: ["ignore", "ignore", "inherit"],
+    env: process.env,
+  });
+  let spawnError: Error | null = null;
+
+  // Surface startup failures explicitly instead of timing out with no clue why.
+  brokerProcess.once("error", (error) => {
+    spawnError = error;
+  });
+  brokerProcess.unref();
+
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    if (spawnError) {
+      throw spawnError;
+    }
+    await delay(200);
+    if (await isBrokerAlive()) {
+      log("Broker started");
+      return;
+    }
+  }
+
+  throw new Error("Failed to start broker daemon after 6 seconds");
+}
+
+/** Resolve the git root for one working directory. */
+async function getGitRoot(cwd: string): Promise<string | null> {
+  try {
+    const result = await execFileText("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      timeoutMs: 3_000,
+    });
+    return result.stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort TTY lookup for the parent Claude process. */
+function getTty(): string | null {
+  try {
+    if (!process.ppid) {
+      return null;
+    }
+
+    // Ask the OS for the parent's controlling terminal so peers can distinguish sessions.
+    const stdout = execFileSync("ps", ["-o", "tty=", "-p", String(process.ppid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    const tty = stdout.trim();
+    return tty && tty !== "?" && tty !== "??" ? tty : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Poll pending messages and forward them into Claude's channel transport. */
+async function pollAndPushMessages(): Promise<void> {
+  if (!myId) {
+    return;
+  }
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    if (result.messages.length === 0) {
+      return;
+    }
 
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
+    let sendersById = new Map<string, Peer>();
+    try {
+      // Fetch sender metadata once per poll cycle so channel notifications include useful context.
+      const peers = await brokerFetch<Peer[]>("/list-peers", {
+        scope: "machine",
+        cwd: myCwd,
+        git_root: myGitRoot,
+      });
+      sendersById = new Map(peers.map((peer) => [peer.id, peer]));
+    } catch {
+      // Peer metadata is nice-to-have; missing it should not block message delivery.
+    }
 
-      // Push as channel notification — this is what makes it immediate
+    for (const message of result.messages) {
+      const sender = sendersById.get(message.from_id);
+
       await mcp.notification({
         method: "notifications/claude/channel",
         params: {
-          content: msg.text,
+          content: message.text,
           meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+            from_id: message.from_id,
+            from_summary: sender?.summary ?? "",
+            from_cwd: sender?.cwd ?? "",
+            sent_at: message.sent_at,
           },
         },
       });
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      log(`Pushed message from ${message.from_id}: ${message.text.slice(0, 80)}`);
     }
-  } catch (e) {
-    // Broker might be down temporarily, don't crash
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+  } catch (error) {
+    log(`Poll error: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
-// --- Startup ---
+/** Unregister the current peer before the MCP process exits. */
+async function cleanup(): Promise<void> {
+  if (cleaningUp) {
+    return;
+  }
 
-async function main() {
-  // 1. Ensure broker is running
+  cleaningUp = true;
+
+  if (myId) {
+    try {
+      await brokerFetch("/unregister", { id: myId });
+      log("Unregistered from broker");
+    } catch {
+      // Best effort during shutdown.
+    }
+  }
+
+  process.exit(0);
+}
+
+/** Start the MCP server, register with the broker, and begin background polling. */
+async function main(): Promise<void> {
+  // Make sure the machine-local broker exists before we try to register this peer.
   await ensureBroker();
 
-  // 2. Gather context
+  // Snapshot the local execution context that other peers need for discovery.
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
@@ -463,10 +479,10 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
   const summaryPromise = (async () => {
     try {
+      // Gather lightweight git context before asking the model for a startup summary.
       const branch = await getGitBranch(myCwd);
       const recentFiles = await getRecentFiles(myCwd);
       const summary = await generateSummary({
@@ -475,81 +491,80 @@ async function main() {
         git_branch: branch,
         recent_files: recentFiles,
       });
+
       if (summary) {
         initialSummary = summary;
         log(`Auto-summary: ${summary}`);
       }
-    } catch (e) {
-      log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    } catch (error) {
+      log(`Auto-summary failed (non-critical): ${error instanceof Error ? error.message : String(error)}`);
     }
   })();
 
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  // Give the summary a short head start without holding up broker registration.
+  await Promise.race([summaryPromise, delay(3_000)]);
 
-  // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
+  const registration = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
   });
-  myId = reg.id;
+  myId = registration.id;
   log(`Registered as peer ${myId}`);
 
-  // If summary generation is still running, update it when done
   if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
+    void summaryPromise.then(async () => {
+      if (!initialSummary || !myId) {
+        return;
+      }
+
+      try {
+        await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+        log(`Late auto-summary applied: ${initialSummary}`);
+      } catch {
+        // Late summary updates are best-effort.
       }
     });
   }
 
-  // 5. Connect MCP over stdio
+  // Attach stdio only after registration so inbound messages can start flowing immediately.
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  const pollTimer = setInterval(() => {
+    void pollAndPushMessages();
+  }, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
-  const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
-      }
+  const heartbeatTimer = setInterval(() => {
+    // Keep the registration fresh without letting a transient broker hiccup kill the server.
+    if (!myId) {
+      return;
     }
+
+    void brokerFetch("/heartbeat", { id: myId }).catch(() => {
+      // Heartbeat failures are non-critical because the next cycle will retry.
+    });
   }, HEARTBEAT_INTERVAL_MS);
 
-  // 8. Clean up on exit
-  const cleanup = async () => {
+  // Make shutdown tidy so dead peers disappear promptly instead of waiting for stale-peer cleanup.
+  const stop = async () => {
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
-    if (myId) {
-      try {
-        await brokerFetch("/unregister", { id: myId });
-        log("Unregistered from broker");
-      } catch {
-        // Best effort
-      }
-    }
-    process.exit(0);
+    await cleanup();
   };
 
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  process.once("SIGINT", () => {
+    void stop();
+  });
+  process.once("SIGTERM", () => {
+    void stop();
+  });
 }
 
-main().catch((e) => {
-  log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
+// Fail loudly on startup errors because a half-started MCP server is not useful.
+main().catch((error) => {
+  log(`Fatal: ${error instanceof Error ? error.message : String(error)}`);
   process.exit(1);
 });

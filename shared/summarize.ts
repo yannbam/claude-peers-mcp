@@ -1,23 +1,44 @@
-/**
- * Generate a 1-2 sentence summary of what a Claude Code instance is likely
- * working on, based on its working directory and git context.
- *
- * Uses OpenAI's gpt-5.4-nano for cheap, fast inference.
- * Requires OPENAI_API_KEY environment variable.
- * Falls back gracefully if unavailable.
- */
+import { execFileText } from "./subprocess.ts";
 
-export async function generateSummary(context: {
+/** Context passed to the auto-summary model for a single Claude session. */
+export interface SummaryContext {
   cwd: string;
   git_root: string | null;
   git_branch?: string | null;
   recent_files?: string[];
-}): Promise<string | null> {
+}
+
+/** Minimal shape needed from the Chat Completions response body. */
+interface OpenAIChatCompletionResponse {
+  choices: Array<{ message: { content: string } }>;
+}
+
+/** Model used for cheap, best-effort startup summaries. */
+const SUMMARY_MODEL = "gpt-5.4-nano";
+
+/** Timeout budget for the auto-summary network request. */
+const SUMMARY_TIMEOUT_MS = 5_000;
+
+/** Split command output into trimmed, non-empty lines. */
+function splitNonEmptyLines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+/**
+ * Generate a short summary of what a Claude Code instance is likely working on.
+ *
+ * Returns `null` when no API key is available or when the network call fails.
+ */
+export async function generateSummary(context: SummaryContext): Promise<string | null> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return null;
   }
 
+  // Keep the prompt grounded in local context that exists before Claude starts working.
   const parts = [`Working directory: ${context.cwd}`];
   if (context.git_root) {
     parts.push(`Git repo root: ${context.git_root}`);
@@ -37,7 +58,7 @@ export async function generateSummary(context: {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-5.4-nano",
+        model: SUMMARY_MODEL,
         messages: [
           {
             role: "system",
@@ -52,88 +73,59 @@ export async function generateSummary(context: {
         max_tokens: 100,
         temperature: 0.3,
       }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS),
     });
 
     if (!res.ok) {
       return null;
     }
 
-    const data = (await res.json()) as {
-      choices: Array<{ message: { content: string } }>;
-    };
+    const data = (await res.json()) as OpenAIChatCompletionResponse;
     return data.choices[0]?.message?.content?.trim() ?? null;
   } catch {
     return null;
   }
 }
 
-/**
- * Get the current git branch name for a directory.
- */
+/** Get the current git branch for a directory, or `null` outside a git repo. */
 export async function getGitBranch(cwd: string): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+    const result = await execFileText("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
       cwd,
-      stdout: "pipe",
-      stderr: "ignore",
+      timeoutMs: 3_000,
     });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      return text.trim();
-    }
+    return result.stdout.trim() || null;
   } catch {
-    // not a git repo
+    return null;
   }
-  return null;
 }
 
-/**
- * Get recently modified tracked files in the git repo.
- */
-export async function getRecentFiles(
-  cwd: string,
-  limit = 10
-): Promise<string[]> {
+/** Get recently modified tracked files for a git worktree. */
+export async function getRecentFiles(cwd: string, limit = 10): Promise<string[]> {
   try {
-    // Get modified/staged files first
-    const diffProc = Bun.spawn(["git", "diff", "--name-only", "HEAD"], {
+    // Prefer local changes first so summaries reflect the user's live work.
+    const diffResult = await execFileText("git", ["diff", "--name-only", "HEAD"], {
       cwd,
-      stdout: "pipe",
-      stderr: "ignore",
+      timeoutMs: 3_000,
     });
-    const diffText = await new Response(diffProc.stdout).text();
-    await diffProc.exited;
+    const modifiedFiles = splitNonEmptyLines(diffResult.stdout);
 
-    const files = diffText
-      .trim()
-      .split("\n")
-      .filter((f) => f.length > 0);
-
-    if (files.length >= limit) {
-      return files.slice(0, limit);
+    if (modifiedFiles.length >= limit) {
+      return modifiedFiles.slice(0, limit);
     }
 
-    // Also get recently committed files
-    const logProc = Bun.spawn(
-      ["git", "log", "--oneline", "--name-only", "-5", "--format="],
+    // Fill the remaining context from recent commits when the worktree is mostly clean.
+    const logResult = await execFileText(
+      "git",
+      ["log", "--oneline", "--name-only", "-5", "--format="],
       {
         cwd,
-        stdout: "pipe",
-        stderr: "ignore",
+        timeoutMs: 3_000,
       }
     );
-    const logText = await new Response(logProc.stdout).text();
-    await logProc.exited;
+    const recentCommittedFiles = splitNonEmptyLines(logResult.stdout);
 
-    const logFiles = logText
-      .trim()
-      .split("\n")
-      .filter((f) => f.length > 0);
-
-    const allFiles = [...new Set([...files, ...logFiles])];
-    return allFiles.slice(0, limit);
+    return [...new Set([...modifiedFiles, ...recentCommittedFiles])].slice(0, limit);
   } catch {
     return [];
   }

@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "claude-peers": {
-      "command": "bun",
-      "args": ["./server.ts"]
+      "command": "pnpm",
+      "args": ["exec", "tsx", "./server.ts"]
     }
   }
 }
